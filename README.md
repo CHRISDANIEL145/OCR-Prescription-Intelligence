@@ -7,7 +7,7 @@ Key features:
 * AWS Textract: Extracts text from doctor's handwritten prescriptions.
 * NER Model: Classifies the extracted text into relevant categories.
 * Alert System: Sends an email alert containing all the prescription details (medicines, doses, and category) to the patient's registered email address.
-
+  APPLICATION LINK : "https://huggingface.co/spaces/Danielchris145/OCR-Prescription-Intelligence"
 ## Approach
 **For more in depth information, [refer this article](https://aryaman.space/from-scribbles-to-structured-data-processing-handwritten-prescriptions-with-spark-nlp/).**
 
