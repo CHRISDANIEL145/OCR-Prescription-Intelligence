@@ -1,6 +1,6 @@
-# ScanPlus
+# OCR Prescription Intelligence
 
-## What is ScanPlus?
+## What is OCR Prescription Intelligence?
 A system that can convert doctor's handwritten prescriptions into machine-readable text and classify the medicines along with their doses. It will also send an alert to the patient's registered email address containing all the relevant prescription details.
 
 Key features:

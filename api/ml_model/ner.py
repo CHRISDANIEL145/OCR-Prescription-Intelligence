@@ -1,124 +1,146 @@
-import sparknlp
-from pyspark.sql import SparkSession
-from pyspark.ml import Pipeline
-from sparknlp.annotator import *
-from sparknlp.training import CoNLL
-from sparknlp.base import DocumentAssembler
-import logging
-from pyspark.sql import functions as F
-
-from ml_model import detect_text
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+import spacy
+from transformers import pipeline
+import re
 
 class InitiateNER:
-    def __init__(self, gpu=True, embedding_model='bert_base_uncased', language='en'):
-        # Initialize Spark session
-        self.spark = sparknlp.start(gpu=gpu)
-        logger.info("Spark NLP session started.")
+    """
+    Named Entity Recognition using spaCy and Hugging Face Transformers
+    Replaces Spark NLP with pure Python solution
+    """
 
-        # Initialize embeddings and NER tagger
-        self.bert_embeddings = BertEmbeddings.pretrained(embedding_model, language) \
-            .setInputCols(["sentence", 'token']) \
-            .setOutputCol("embeddings") \
-            .setCaseSensitive(False)
+    def __init__(self, gpu=False):
+        """
+        Initialize NER model
+        Args:
+            gpu: Boolean to use GPU (requires CUDA)
+        """
+        self.gpu = gpu
+        print("Loading spaCy model...")
 
-        self.ner_tagger = NerDLApproach() \
-            .setInputCols(["sentence", "token", "embeddings"]) \
-            .setLabelColumn("label") \
-            .setOutputCol("ner") \
-            .setMaxEpochs(20) \
-            .setLr(0.001) \
-            .setPo(0.005) \
-            .setBatchSize(32) \
-            .setValidationSplit(0.1) \
-            .setUseBestModel(True) \
-            .setEnableOutputLogs(True)
-        
-        # Initialize other components for prediction
-        self.document_assembler = DocumentAssembler() \
-            .setInputCol("text") \
-            .setOutputCol("document")
-
-        self.sentence_detector = SentenceDetector() \
-            .setInputCols(['document']) \
-            .setOutputCol('sentence')
-
-        self.tokenizer = Tokenizer() \
-            .setInputCols(['sentence']) \
-            .setOutputCol('token')
-
-        self.converter = NerConverter() \
-            .setInputCols(["document", "token", "ner"]) \
-            .setOutputCol("ner_span")
-
-    def train_model(self, training_file, save_path):
         try:
-            training_data = CoNLL().readDataset(self.spark, training_file)
-            training_data = self.bert_embeddings.transform(training_data).drop("text", "document", "pos")
+            # Load pre-trained spaCy model for English
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            print("spaCy model not found. Downloading...")
+            import subprocess
+            subprocess.check_call(["python", "-m", "spacy", "download", "en_core_web_sm"])
+            self.nlp = spacy.load("en_core_web_sm")
 
-            logger.info("Training model...")
-            self.ner_model = self.ner_tagger.fit(training_data)
-            logger.info("Model trained successfully.")
-
-            self.ner_model.write().overwrite().save(save_path)
-            logger.info(f"Model saved at: {save_path}")
-
-        except Exception as e:
-            logger.error(f"Error during training: {e}")
-
-    def load_model(self, model_path):
+        # Load Hugging Face medical NER pipeline for better medical entity extraction
+        device = 0 if gpu else -1  # -1 for CPU
+        print("Loading medical NER transformer model...")
         try:
-            self.loaded_ner_model = NerDLModel.load(model_path) \
-                .setInputCols(["sentence", "token", "embeddings"]) \
-                .setOutputCol("ner")
-
-            logger.info("Model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Error loading model: {e}")
-
-    def predict(self, text):
-        try:
-            # Create or reuse prediction pipeline
-            if not hasattr(self, 'prediction_pipeline'):
-                self.prediction_pipeline = Pipeline(
-                    stages=[
-                        self.document_assembler,
-                        self.sentence_detector,
-                        self.tokenizer,
-                        self.bert_embeddings,
-                        self.loaded_ner_model,
-                        self.converter
-                    ]
-                )
-                logger.info("Prediction pipeline created.")
-
-            sample_data = self.spark.createDataFrame([[text]]).toDF("text")
-            prediction_model = self.prediction_pipeline.fit(self.spark.createDataFrame([['']]).toDF("text"))
-            preds = prediction_model.transform(sample_data)
-            pipeline_result = preds.collect()[0]
-
-            return self.format_output(pipeline_result)
-
-        except Exception as e:
-            logger.error(f"Error during prediction: {e}")
-            return {"error": str(e)}
-
-    @staticmethod
-    def format_output(pipeline_result):
-        result_dict = {}
-        for entity in pipeline_result.ner_span:
-            entity_type = entity.metadata['entity']
-            result_dict.setdefault(entity_type, []).append(
-                (entity.result, (entity.begin, entity.end))
+            self.medical_ner = pipeline(
+                "token-classification",
+                model="d4data/biomedical-ner-all",
+                device=device,
+                aggregation_strategy="simple"
             )
-        return result_dict
-    
-ner_model = InitiateNER()
-# ner_model.train_model("../content/NERDataset.txt", "../content/model")
+        except Exception as e:
+            print(f"Warning: Could not load medical NER model: {e}")
+            print("Falling back to spaCy NER only")
+            self.medical_ner = None
 
-ner_model.load_model("../content/model")
-print(ner_model.predict(detect_text("../images/prescriptions/check2.jpeg")))
+        print("NER Model initialized successfully!")
+
+    def extract_entities(self, text):
+        """
+        Extract entities from prescription text
+        Args:
+            text: Input prescription text
+
+        Returns:
+            dict: Extracted entities (medications, doses, instructions)
+        """
+        entities = {
+            'medications': [],
+            'doses': [],
+            'instructions': [],
+            'routes': [],
+            'frequencies': []
+        }
+
+        # Clean and preprocess text
+        text = text.strip()
+
+        # Use spaCy for general NER
+        doc = self.nlp(text)
+
+        # Extract entities using spaCy
+        for ent in doc.ents:
+            if ent.label_ in ["PRODUCT", "ORG"]:  # Medications often tagged as PRODUCT
+                entities['medications'].append(ent.text)
+
+        # Use medical NER if available
+        if self.medical_ner:
+            try:
+                medical_entities = self.medical_ner(text)
+                for entity in medical_entities:
+                    label = entity['entity_group']
+                    text_val = entity['word']
+
+                    if label.lower() in ["medication", "drug"]:
+                        entities['medications'].append(text_val)
+                    elif label.lower() == "dose":
+                        entities['doses'].append(text_val)
+                    elif label.lower() == "route":
+                        entities['routes'].append(text_val)
+                    elif label.lower() == "frequency":
+                        entities['frequencies'].append(text_val)
+            except Exception as e:
+                print(f"Medical NER error: {e}")
+
+        # Extract dose patterns using regex
+        dose_pattern = r'\d+\s*(mg|ml|g|mcg|units?|tablets?|capsules?)'
+        doses = re.findall(dose_pattern, text, re.IGNORECASE)
+        entities['doses'].extend(doses)
+
+        # Extract frequency patterns
+        frequency_keywords = ['once daily', 'twice daily', 'thrice daily', 'every 6 hours', 
+                            'every 8 hours', 'every 12 hours', 'as needed', 'bd', 'tid', 'qid']
+        for freq in frequency_keywords:
+            if freq.lower() in text.lower():
+                entities['frequencies'].append(freq)
+
+        # Extract route patterns
+        route_keywords = ['oral', 'iv', 'im', 'subcutaneous', 'topical', 'inhalation', 
+                         'rectal', 'transdermal', 'po', 'sc']
+        for route in route_keywords:
+            if route.lower() in text.lower():
+                entities['routes'].append(route)
+
+        # Remove duplicates
+        for key in entities:
+            entities[key] = list(set(entities[key]))
+
+        return entities
+
+    def process_prescription(self, text):
+        """
+        Process complete prescription and extract structured information
+        Args:
+            text: Prescription text
+
+        Returns:
+            dict: Structured prescription data
+        """
+        entities = self.extract_entities(text)
+
+        prescription_data = {
+            'raw_text': text,
+            'medications': entities['medications'],
+            'doses': entities['doses'],
+            'routes': entities['routes'],
+            'frequencies': entities['frequencies'],
+            'instructions': entities['instructions']
+        }
+
+        return prescription_data
+
+
+# Initialize NER model when module loads
+try:
+    ner_model = InitiateNER(gpu=False)  # Set gpu=True if you have CUDA
+except Exception as e:
+    print(f"Error initializing NER: {e}")
+    ner_model = None

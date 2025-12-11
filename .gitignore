@@ -1,3 +1,37 @@
+# Virtual environments
+venv/
+venv_new/
 frontend/my-project-env/
 api/api-env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
 api/__pycache__/
+api/ml_model/__pycache__/
+frontend/__pycache__/
+
+# Environment variables (SENSITIVE - DO NOT COMMIT)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+
+# Uploads
+uploads/
+api/uploads/
+frontend/uploads/
+
+# Instance folder
+api/instance/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

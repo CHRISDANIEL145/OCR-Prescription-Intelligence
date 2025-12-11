@@ -1,253 +1,456 @@
-from flask import Flask, jsonify, request, abort, make_response
-from flask_restful import Api, Resource
-import json
 import os
-import bcrypt
-# from flask_security import auth_required, logout_user, current_user
-from functools import wraps
+import sys
+import io
+import json
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import boto3
+from dotenv import load_dotenv
+import tempfile
+import uuid
 
-from models import *
+# Load environment variables
+load_dotenv()
 
-from werkzeug.utils import secure_filename
-import uuid as uuid
-
-from htmlbody import *
-
-from apscheduler.schedulers.background import BackgroundScheduler
-import base64
-
-from ml_model.ner import *
-
-import jwt
-from flask_jwt_extended import create_access_token
-from flask_jwt_extended import get_jwt
-from flask_jwt_extended import get_jwt_identity
-from flask_jwt_extended import jwt_required
-from flask_jwt_extended import JWTManager
-from flask_jwt_extended import set_access_cookies
-from flask_jwt_extended import unset_jwt_cookies
-import datetime
-
-
-curr_dir = os.path.abspath(os.path.dirname(__file__))
+# Initialize Flask app
 app = Flask(__name__)
+CORS(app)
 
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+# Create uploads directory for temporary files
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-scheduler.start()
+# Initialize NER Model
+print("Loading spaCy model...")
+print("Loading medical NER transformer model...")
 
-app.config["JWT_COOKIE_SECURE"] = False
-app.config["JWT_TOKEN_LOCATION"] = ["headers"]
-app.config["JWT_SECRET_KEY"] = "super-secret"  # Change this in your code!
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=30)
+try:
+    from ml_model.ner import ner_model
+    print("NER Model initialized successfully!")
+except Exception as e:
+    print(f"Error loading NER model: {e}")
+    ner_model = None
 
-jwt = JWTManager(app)
+# Initialize AWS Textract
+try:
+    AWS_REGION = os.getenv('AWS_REGION', 'ap-south-1')
+    AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 
-api = Api(app)
-app.config['SQLALCHEMY_DATABASE_URI'] = "sqlite:///database.sqlite"
-
-upload_folder_pfp = "images/pfp"
-app.config["UPLOAD_FOLDER_PFP"] = upload_folder_pfp
-
-upload_folder_prescriptions = "images/prescriptions"
-app.config["UPLOAD_FOLDER_prescriptions"] = upload_folder_prescriptions
-
-db.init_app(app)
-app.app_context().push()
-
-salt = bcrypt.gensalt()
-
-
-######################
-from flask_mail import Mail, Message
-
-app.config.update(dict(
-    DEBUG = True,
-    MAIL_SERVER = 'smtp.gmail.com',
-    MAIL_PORT = 587,
-    MAIL_USE_TLS = True,
-    MAIL_USE_SSL = False,
-    MAIL_USERNAME = 'xyz@gmail.com',
-    MAIL_PASSWORD = '',
-))
-
-mail= Mail(app)
-
-def send_mail(message, mail_id):
-    with app.app_context():
-        msg = Message('Hello', sender = 'xyz@gmail.com', recipients = [mail_id])
-        # mail.send(msg)
-        msg.html = mail_body(message)
-        mail.send(msg)
-        print("Sent")
-        return
-
-def encoding_image(path):
-    with open(path, mode='rb') as file:
-        img = file.read()
-    return base64.b64encode(img).decode('utf-8')
+    textract_client = boto3.client(
+        'textract',
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY
+    )
+    print("✓ AWS Textract client initialized")
+except Exception as e:
+    print(f"Warning: AWS Textract not configured: {e}")
+    textract_client = None
 
 
-class SignUp(Resource):
-    def post(self):
-        fname = request.form['full_name']
-        email = request.form['email'].encode('utf-8')
-        pwd = request.form['password']
-        isEmpty = App_user.query.filter_by(email = email).first()
-        if isEmpty:
-            return make_response("Invalid Email", 401, {'status': "exists"})
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
-        pwd = bytes(pwd, 'utf-8')
-        pwd = bcrypt.hashpw(pwd, salt)
-        q = App_user(email = email, full_name = fname, password = pwd, profile_pic = "default_pic.png")
-        db.session.add(q)
-        db.session.commit()
-        return make_response("User Successfully Registered",200, {'status' : "success"})
-    
+def extract_text_from_image(image_bytes):
+    """Extract text from image using AWS Textract"""
+    try:
+        if not textract_client:
+            return "AWS Textract not configured"
 
-class Login(Resource):
-    def post(self):
-        email = request.form['email'].encode('utf-8')
-        pwd = request.form['password'].encode('utf-8')
-        find_user = App_user.query.filter_by(email = email).first()
-        if find_user:
-            user_pass = find_user.password
-            if bcrypt.checkpw(pwd, user_pass):
-                # token = jwt.encode({'user': str(find_user.email, 'UTF-8'), 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=30)}, app.config['SECRET_KEY'])
-                token = create_access_token(identity=str(find_user.email, 'UTF-8'))
-                response = jsonify({"msg": "login successful"})
-                set_access_cookies(response, token)
-                print(token)
-                return make_response("success", 200, {'authentication': "success", 'token': token})
-            else:
-                return make_response("Invalid Credentials", 401, {'authentication': "login required", 'token':''})
-        else:
-            return make_response("Invalid Credentials", 401, {'authentication': "login required", 'token':''})
+        response = textract_client.detect_document_text(
+            Document={'Bytes': image_bytes}
+        )
 
-class PrescriptionUpload(Resource):
-    @jwt_required()
-    def post(self):
-        # try:
-        email = request.form['email']
-        pic_name = request.form['pic_name']
+        # Extract text from blocks
+        text_lines = []
+        for block in response.get('Blocks', []):
+            if block['BlockType'] == 'LINE':
+                text_lines.append(block['Text'])
 
-        q = Prescription(prescription_name = pic_name, user_email = email)
-        db.session.add(q)
-        db.session.commit()
-        
-        
-        x = (ner_model.predict(detect_text(os.path.join(app.config['UPLOAD_FOLDER_prescriptions'], pic_name))))
+        return '\n'.join(text_lines)
 
-        # medicine = x["Medicine"]
-        # msg = """Your Current Medication - 
-        # """
-        counter = 0
-        # for i in medicine:
-        #     msg = msg + str(counter) + ") " + i + "\n"
+    except Exception as e:
+        print(f"Error in Textract: {e}")
+        return f"Error extracting text: {str(e)}"
 
-        # job = scheduler.add_job(send_mail,'interval', [msg, email], hour = "10")
 
-        return json.dumps(x)
+def process_with_ner(text):
+    """Process text with NER model to extract entities"""
+    try:
+        if not ner_model:
+            return {
+                'medications': [],
+                'doses': [],
+                'routes': [],
+                'frequencies': [],
+                'raw_text': text
+            }
 
-        # except:
-        #     abort(500)
+        # Use NER model to extract entities
+        result = ner_model.extract_entities(text)
 
-class Dashboard(Resource):
-    @jwt_required()
-    def get(self):
+        return {
+            'medications': result.get('medications', []),
+            'doses': result.get('doses', []),
+            'routes': result.get('routes', []),
+            'frequencies': result.get('frequencies', []),
+            'raw_text': text
+        }
+
+    except Exception as e:
+        print(f"Error in NER processing: {e}")
+        return {
+            'medications': [],
+            'doses': [],
+            'routes': [],
+            'frequencies': [],
+            'raw_text': text,
+            'error': str(e)
+        }
+
+
+# ============================================================================
+# API ROUTES
+# ============================================================================
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'components': {
+            'flask': 'running',
+            'ner_model': 'initialized' if ner_model else 'not_loaded',
+            'textract': 'configured' if textract_client else 'not_configured'
+        },
+        'timestamp': datetime.now().isoformat()
+    }), 200
+
+
+@app.route('/api/process-text', methods=['POST'])
+def process_text():
+    """
+    Process prescription text with NER
+
+    Request body:
+    {
+        "text": "prescription text"
+    }
+
+    Response:
+    {
+        "success": true,
+        "medications": [...],
+        "doses": [...],
+        "routes": [...],
+        "frequencies": [...],
+        "raw_text": "..."
+    }
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'text' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing "text" field in request body'
+            }), 400
+
+        text = data.get('text', '').strip()
+
+        if not text:
+            return jsonify({
+                'success': False,
+                'error': 'Prescription text cannot be empty'
+            }), 400
+
+        # Process with NER
+        result = process_with_ner(text)
+
+        return jsonify({
+            'success': True,
+            **result
+        }), 200
+
+    except Exception as e:
+        print(f"Error in /api/process-text: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/process-image', methods=['POST'])
+def process_image():
+    """
+    Process prescription image with AWS Textract + NER
+
+    Request: multipart/form-data with 'file' field
+
+    Response:
+    {
+        "success": true,
+        "medications": [...],
+        "doses": [...],
+        "routes": [...],
+        "frequencies": [...],
+        "raw_text": "..."
+    }
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+
+        # Read file bytes
+        image_bytes = file.read()
+
+        # Save temporarily (Windows-compatible path)
+        temp_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{file.filename}"
+        temp_path = os.path.join(UPLOAD_FOLDER, temp_filename)
+
+        print(f"Saving file to: {temp_path}")
+
+        # Save file
+        with open(temp_path, 'wb') as f:
+            f.write(image_bytes)
+
+        # Extract text using AWS Textract
+        extracted_text = extract_text_from_image(image_bytes)
+
+        # Clean up temporary file
         try:
-        #uname = request.form["email"]
-        # print(auth.current_user())
-            email = get_jwt_identity().encode("utf-8")
-            print(email)
-            user = App_user.query.filter_by(email = email).first()
-            uname = user.email
-            # find_user = App_user.query.filter_by(email = uname).first()
-            # if not find_user:
-            #     abort(401)
-            presciptions = Prescription.query.filter_by(user_email = uname).all()
-            print(presciptions)
-            presciptions_dict = {}
-            for i in presciptions:
-                temp = {}
-                temp["id"] = i.id,
-                temp["prescription_name"] =  i.prescription_name,
-                temp["date"] = i.time_stamp.strftime('%m/%d/%Y'),
-                print("./images/prescriptions/"+i.prescription_name)
-                temp["image"] = encoding_image("./images/prescriptions/"+i.prescription_name),
-                presciptions_dict[i.id] = temp
-            print(presciptions_dict)
-            return jsonify({"name": user.full_name, "pfp": user.profile_pic, "number_of_prescription": user.number_of_prescription, "prescriptions": presciptions_dict})
-        except:
-            abort(500)
+            os.remove(temp_path)
+            print(f"Cleaned up: {temp_path}")
+        except Exception as e:
+            print(f"Error cleaning up file: {e}")
 
-class ViewPrescription(Resource):
-    @jwt_required()
-    def post(self):
-        curr_id = request.form["id"]
-        find_prescription = Prescription.query.filter_by(id = curr_id).first()
-        if not find_prescription:
-            abort(401)
-        return make_response(jsonify({"picture":encoding_image("./images/prescriptions/"+find_prescription.prescription_name)}), 200)
-        
-class DeletePrescription(Resource):
-    @jwt_required()
-    def post(self):
-        curr_id = request.form["id"]    
-        x = Prescription.query.filter_by(id = curr_id).first()
-        if not x:
-            abort(401)
-        db.session.delete(x)
-        db.session.commit()
-        return make_response(jsonify({'msg': "Successfully signed in!!!"}), 200)
-    
+        # Process with NER
+        result = process_with_ner(extracted_text)
 
-class Logout(Resource): #done
-    @jwt_required()
-    def delete(self):
-        response = jsonify({"msg": "logout successful"})
-        unset_jwt_cookies(response)
-        print(response)
-        return response
-        # logout_user()
-        # return make_response(jsonify({'msg': "Successfully logged out!!!"}), 200)
+        return jsonify({
+            'success': True,
+            **result
+        }), 200
+
+    except Exception as e:
+        print(f"Error in /api/process-image: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
-class SendMail(Resource):
-    def get(self):
-        message = "hi"
-        mail_id = "xyz@gmail.com"
-        
-        with app.app_context():
-            job = scheduler.add_job(send_mail,'interval', ["hi", "xyz@gmail.com"], seconds=10)
-        return
+@app.route('/api/extract-entities', methods=['POST'])
+def extract_entities():
+    """
+    Extract specific entities from prescription text
 
-class Scan(Resource):
-    def post(self):
-        file_path = request.form['path']
-        x = (ner_model.predict(detect_text(file_path)))
+    Request body:
+    {
+        "text": "prescription text"
+    }
 
-        return json.dumps(x)
+    Response:
+    {
+        "success": true,
+        "entities": {
+            "medications": [...],
+            "doses": [...],
+            "routes": [...],
+            "frequencies": [...]
+        }
+    }
+    """
+    try:
+        data = request.get_json()
 
-class Schedule(Resource):
-    def post(self):
-        pass
+        if not data or 'text' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing "text" field'
+            }), 400
+
+        text = data.get('text', '').strip()
+
+        if not text:
+            return jsonify({
+                'success': False,
+                'error': 'Text cannot be empty'
+            }), 400
+
+        # Process with NER
+        result = process_with_ner(text)
+
+        return jsonify({
+            'success': True,
+            'entities': {
+                'medications': result.get('medications', []),
+                'doses': result.get('doses', []),
+                'routes': result.get('routes', []),
+                'frequencies': result.get('frequencies', [])
+            },
+            'raw_text': result.get('raw_text', text)
+        }), 200
+
+    except Exception as e:
+        print(f"Error in /api/extract-entities: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
-api.add_resource(Login, "/login")
-api.add_resource(SignUp, "/signup")
-api.add_resource(PrescriptionUpload, "/dashboard/upload_prescription")
-api.add_resource(Dashboard, "/dashboard")
-api.add_resource(ViewPrescription, "/dashboard/view")
-api.add_resource(DeletePrescription, "/dashboard/delete")
-api.add_resource(Logout, "/logout")
-api.add_resource(SendMail, "/api/mail")
-api.add_resource(Scan, "/scan")
-api.add_resource(Schedule, "/schedule")
+@app.route('/api/batch-process', methods=['POST'])
+def batch_process():
+    """
+    Process multiple prescriptions in batch
 
-if __name__=="__main__":
-    db.create_all()
-    
-    ner_model = InitiateNER()
-    ner_model.load_model("./content/model")
-    app.run(debug=True)
+    Request body:
+    {
+        "prescriptions": [
+            {"id": "1", "text": "prescription 1"},
+            {"id": "2", "text": "prescription 2"}
+        ]
+    }
+
+    Response:
+    {
+        "success": true,
+        "count": 2,
+        "results": [
+            {"id": "1", "medications": [...], ...},
+            {"id": "2", "medications": [...], ...}
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'prescriptions' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing "prescriptions" field'
+            }), 400
+
+        prescriptions = data.get('prescriptions', [])
+
+        if not isinstance(prescriptions, list):
+            return jsonify({
+                'success': False,
+                'error': '"prescriptions" must be a list'
+            }), 400
+
+        results = []
+        for prescription in prescriptions:
+            prescription_id = prescription.get('id', 'unknown')
+            text = prescription.get('text', '')
+
+            if text:
+                result = process_with_ner(text)
+                results.append({
+                    'id': prescription_id,
+                    **result
+                })
+
+        return jsonify({
+            'success': True,
+            'count': len(results),
+            'results': results
+        }), 200
+
+    except Exception as e:
+        print(f"Error in /api/batch-process: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/', methods=['GET'])
+def index():
+    """API documentation endpoint"""
+    return jsonify({
+        'name': 'OCR Prescription Intelligence API',
+        'version': '1.0.0',
+        'description': 'Prescription digitization with NER',
+        'endpoints': {
+            'GET /api/health': 'Health check',
+            'POST /api/process-text': 'Process prescription text',
+            'POST /api/process-image': 'Process prescription image',
+            'POST /api/extract-entities': 'Extract entities from text',
+            'POST /api/batch-process': 'Batch process prescriptions'
+        },
+        'status': 'running'
+    }), 200
+
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors"""
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 errors"""
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
+
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    """Handle file too large errors"""
+    return jsonify({
+        'success': False,
+        'error': 'File too large'
+    }), 413
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == '__main__':
+    print("\n" + "="*70)
+    print("OCR Prescription Intelligence API - Python-based NER Version")
+    print("="*70)
+    print(f"✓ NER Model: {'Initialized' if ner_model else 'Not loaded'}")
+    print(f"✓ AWS Textract: {'Configured' if textract_client else 'Not configured'}")
+    print(f"\nUpload folder: {os.path.abspath(UPLOAD_FOLDER)}")
+    print("\nStarting Flask server on http://0.0.0.0:5000")
+    print("="*70 + "\n")
+
+    # Run Flask app
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=True,
+        use_reloader=False
+    )
